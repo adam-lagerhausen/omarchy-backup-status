@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""Collect backup job status as JSON. Does not read Borg credentials."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+STATE = HOME / ".local" / "state"
+DB_LOG = STATE / "database-backup" / "staging" / "backup.log"
+DB_SQLITE = STATE / "database-backup" / "staging" / "SQLITE_STATUS"
+WS_STATUS = STATE / "workstation-backup" / "STATUS"
+
+DB_SERVICE = "database-backup.service"
+DB_TIMER = "database-backup.timer"
+WS_SERVICE = "workstation-backup.service"
+WS_TIMER = "workstation-backup.timer"
+
+DB_STALE_SEC = 6 * 3600
+WS_STALE_SEC = 36 * 3600
+
+ARCHIVE_RE = re.compile(r"(databases|workstation)-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z")
+ALL_ARCHIVES_RE = re.compile(
+    r"All archives:\s+\S+\s+\S+\s+\S+\s+\S+\s+(\d+(?:\.\d+)?)\s+([KMGT]i?B)\b"
+)
+SIZE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([KMGT]i?B|B)$", re.I)
+
+UNITS = {
+    "B": 1,
+    "KB": 1_000,
+    "MB": 1_000_000,
+    "GB": 1_000_000_000,
+    "TB": 1_000_000_000_000,
+    "KIB": 1024,
+    "MIB": 1024**2,
+    "GIB": 1024**3,
+    "TIB": 1024**4,
+}
+
+
+def run(command: list[str], timeout: float) -> tuple[int, str, str]:
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return 127, "", command[0] + " not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out"
+    return completed.returncode, completed.stdout, completed.stderr
+
+
+def show(unit: str) -> dict[str, str]:
+    code, stdout, _ = run(
+        ["systemctl", "--user", "show", unit, "--no-pager"],
+        timeout=3,
+    )
+    if code != 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        out[key] = value
+    return out
+
+
+def parse_ts(value: str) -> int | None:
+    value = (value or "").strip()
+    if not value or value in {"n/a", "0"}:
+        return None
+    code, stdout, _ = run(["date", "-d", value, "+%s"], timeout=1.5)
+    if code != 0:
+        return None
+    try:
+        return int(stdout.strip())
+    except ValueError:
+        return None
+
+
+def parse_size(label: str) -> float | None:
+    match = SIZE_RE.match(label.strip())
+    if not match:
+        return None
+    amount = float(match.group(1))
+    unit = match.group(2).upper()
+    factor = UNITS.get(unit)
+    if factor is None:
+        return None
+    return amount * factor
+
+
+def format_bytes(n: float) -> str:
+    if n >= 1_000_000_000_000:
+        value = n / 1_000_000_000_000
+        unit = "TB"
+    elif n >= 1_000_000_000:
+        value = n / 1_000_000_000
+        unit = "GB"
+    elif n >= 1_000_000:
+        value = n / 1_000_000
+        unit = "MB"
+    elif n >= 1_000:
+        value = n / 1_000
+        unit = "KB"
+    else:
+        return f"{int(n)} B"
+    if abs(value - round(value)) < 0.05:
+        return f"{int(round(value))} {unit}"
+    return f"{value:.1f} {unit}"
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def last_archive(text: str, prefix: str) -> str:
+    found = ""
+    for match in ARCHIVE_RE.finditer(text):
+        if match.group(1) == prefix:
+            found = match.group(0)
+    return found
+
+
+def last_unique_bytes(text: str) -> float | None:
+    found = None
+    for match in ALL_ARCHIVES_RE.finditer(text):
+        parsed = parse_size(match.group(1) + " " + match.group(2))
+        if parsed is not None:
+            found = parsed
+    return found
+
+
+def journal(unit: str) -> str:
+    _, stdout, _ = run(
+        [
+            "journalctl",
+            "--user-unit",
+            unit,
+            "-n",
+            "160",
+            "--no-pager",
+            "--output=cat",
+        ],
+        timeout=4,
+    )
+    return stdout
+
+
+def linger_on() -> bool:
+    code, stdout, _ = run(
+        ["loginctl", "show-user", os.environ.get("USER", ""), "-p", "Linger"],
+        timeout=2,
+    )
+    return code == 0 and "Linger=yes" in stdout
+
+
+def empty_job(title: str, job_id: str) -> dict:
+    return {
+        "id": job_id,
+        "title": title,
+        "state": "healthy",
+        "running": False,
+        "timerEnabled": False,
+        "timerActive": False,
+        "lastExit": None,
+        "lastFinishedAt": None,
+        "lastStartedAt": None,
+        "nextAt": None,
+        "archive": "",
+        "sqlite": "",
+        "error": "",
+    }
+
+
+def job_state(job: dict, stale_sec: int, now: int) -> str:
+    if job["running"]:
+        return "running"
+    if job["lastExit"] not in (0, None):
+        return "failed"
+    finished = job["lastFinishedAt"]
+    if finished and now - finished > stale_sec:
+        return "warning"
+    if not job["timerEnabled"] or not job["timerActive"]:
+        return "warning"
+    return "healthy"
+
+
+def collect_job(
+    title: str,
+    job_id: str,
+    service: str,
+    timer: str,
+    archive: str,
+    stale_sec: int,
+    now: int,
+    sqlite: str = "",
+    extra_error: str = "",
+) -> dict:
+    svc = show(service)
+    tmr = show(timer)
+    job = empty_job(title, job_id)
+    if not svc and not tmr:
+        job["state"] = "missing"
+        job["error"] = f"{service} is not installed"
+        return job
+
+    job["timerEnabled"] = tmr.get("UnitFileState") == "enabled"
+    job["timerActive"] = tmr.get("ActiveState") == "active"
+    active = svc.get("ActiveState", "")
+    sub = svc.get("SubState", "")
+    job["running"] = active in {"active", "activating"} and sub not in {"dead", "exited"}
+    result = svc.get("Result", "")
+    status = svc.get("ExecMainStatus", "")
+    try:
+        job["lastExit"] = int(status) if status != "" else None
+    except ValueError:
+        job["lastExit"] = None
+    if result not in {"", "success"} and not job["running"]:
+        if job["lastExit"] in (0, None):
+            job["lastExit"] = 1
+    job["lastStartedAt"] = parse_ts(svc.get("ExecMainStartTimestamp", ""))
+    job["lastFinishedAt"] = parse_ts(svc.get("ExecMainExitTimestamp", ""))
+    job["nextAt"] = parse_ts(tmr.get("NextElapseUSecRealtime", ""))
+    job["archive"] = archive
+    job["sqlite"] = sqlite
+    if extra_error:
+        job["error"] = extra_error
+    elif not job["timerEnabled"]:
+        job["error"] = f"{timer} is not enabled"
+    elif result not in {"", "success"} and not job["running"]:
+        job["error"] = f"{service} result {result}"
+    job["state"] = job_state(job, stale_sec, now)
+    return job
+
+
+def overall_state(jobs: list[dict], quota_percent: float | None) -> str:
+    states = [job["state"] for job in jobs]
+    if "failed" in states or "missing" in states:
+        return "failed"
+    if "running" in states:
+        return "running"
+    if "warning" in states:
+        return "warning"
+    if quota_percent is not None and quota_percent >= 90:
+        return "warning"
+    return "healthy"
+
+
+def collect(quota_gb: float) -> dict:
+    now = int(time.time())
+    db_log = read_text(DB_LOG)
+    ws_status = read_text(WS_STATUS)
+    sqlite = "ok" if "ok" in read_text(DB_SQLITE).lower() and "not ok" not in read_text(DB_SQLITE).lower() else read_text(DB_SQLITE).strip()
+    if sqlite and all(line.endswith(": ok") or line == "" for line in sqlite.splitlines()):
+        sqlite = "ok"
+
+    db_journal = journal(DB_SERVICE)
+    ws_journal = journal(WS_SERVICE)
+    combined = db_log + "\n" + ws_status + "\n" + db_journal + "\n" + ws_journal
+
+    db_archive = last_archive(db_log, "databases") or last_archive(db_journal, "databases")
+    ws_archive = last_archive(ws_status, "workstation") or last_archive(ws_journal, "workstation")
+
+    db_error = ""
+    if "timed out" in db_journal.lower() and "Archive name:" not in db_journal.split("Started ")[-1]:
+        last_chunk = db_journal[-2000:]
+        if "timed out" in last_chunk.lower() and "success status" not in last_chunk:
+            db_error = "borg create timed out"
+
+    wait_note = "concurrent-backup limit" in db_journal.split("Archive name:")[-1] if "Archive name:" in db_journal else "concurrent-backup limit" in db_journal[-2500:]
+    collation = "collation version mismatch" in (db_log + db_journal).lower()
+
+    db = collect_job(
+        "Databases",
+        "databases",
+        DB_SERVICE,
+        DB_TIMER,
+        db_archive,
+        DB_STALE_SEC,
+        now,
+        sqlite=sqlite,
+        extra_error=db_error,
+    )
+    ws = collect_job(
+        "Workstation",
+        "workstation",
+        WS_SERVICE,
+        WS_TIMER,
+        ws_archive,
+        WS_STALE_SEC,
+        now,
+    )
+
+    unique = last_unique_bytes(combined)
+    quota_bytes = quota_gb * 1_000_000_000
+    percent = None
+    if unique is not None and quota_bytes > 0:
+        percent = round(100.0 * unique / quota_bytes, 1)
+
+    notes: list[dict] = []
+    linger = linger_on()
+    if not linger:
+        notes.append({"text": "User lingering is off, so backups will not run while logged out.", "fail": True})
+    if db["state"] == "missing":
+        notes.append({"text": "database-backup.timer is not installed on this machine.", "fail": True})
+    if ws["state"] == "missing":
+        notes.append({"text": "workstation-backup.timer is not installed on this machine.", "fail": True})
+    if db["state"] == "warning" and db["lastFinishedAt"] and now - db["lastFinishedAt"] > DB_STALE_SEC:
+        notes.append({"text": "The four-hour database backup is overdue.", "fail": False})
+    if ws["state"] == "warning" and ws["lastFinishedAt"] and now - ws["lastFinishedAt"] > WS_STALE_SEC:
+        notes.append({"text": "The nightly workstation backup is overdue.", "fail": False})
+    if collation:
+        notes.append({"text": "Homeschool PostgreSQL collation does not match the OS. Dump still succeeds.", "fail": False})
+    if wait_note and db["state"] != "failed":
+        notes.append({"text": "BorgBase made a recent run wait for a free slot.", "fail": False})
+    if percent is not None and percent >= 90:
+        notes.append({"text": f"BorgBase unique data is at {percent:.0f}% of the {format_bytes(quota_bytes)} quota.", "fail": False})
+    if db["state"] == "failed" and db["error"]:
+        notes.append({"text": db["error"] + ". The previous archive is still on BorgBase." if "BorgBase" not in db["error"] else db["error"], "fail": True})
+
+    state = overall_state([db, ws], percent)
+    if not linger and state == "healthy":
+        state = "warning"
+
+    last_offsite = max(
+        [ts for ts in (db["lastFinishedAt"], ws["lastFinishedAt"]) if ts],
+        default=None,
+    )
+
+    return {
+        "ok": True,
+        "state": state,
+        "linger": linger,
+        "checkedAt": now,
+        "lastOffsiteAt": last_offsite,
+        "quota": {
+            "known": unique is not None,
+            "uniqueBytes": unique,
+            "quotaBytes": quota_bytes,
+            "percent": percent,
+            "uniqueLabel": format_bytes(unique) if unique is not None else "",
+            "quotaLabel": format_bytes(quota_bytes),
+        },
+        "jobs": {
+            "databases": db,
+            "workstation": ws,
+        },
+        "notes": notes,
+    }
+
+
+def main() -> int:
+    quota_gb = 250.0
+    if len(sys.argv) > 1:
+        try:
+            quota_gb = float(sys.argv[1])
+        except ValueError:
+            quota_gb = 250.0
+        if quota_gb <= 0:
+            quota_gb = 250.0
+    payload = collect(quota_gb)
+    json.dump(payload, sys.stdout, separators=(",", ":"))
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

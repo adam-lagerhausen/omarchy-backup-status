@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.adam-lagerhausen.backup-status",
+  "name": "Backup Status",
+  "version": "1.0.0",
+  "author": "Adam Lagerhausen",
+  "license": "MIT",
+  "description": "Live status for the four-hour database backup and the nightly home archive.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Backups",
+    "description": "Bar icon and details panel for BorgBase database and workstation backups.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 60,
+      "quotaGb": 250,
+      "barStyle": "icon"
+    },
+    "schema": [
+      {
+        "key": "barStyle",
+        "type": "enum",
+        "label": "Bar style",
+        "options": ["icon", "pip", "label"],
+        "defaultValue": "icon",
+        "description": "Icon only, a status pip on the icon, or the word ok/warn/fail."
+      },
+      {
+        "key": "quotaGb",
+        "type": "integer",
+        "label": "BorgBase quota (GB)",
+        "min": 1,
+        "max": 10000,
+        "step": 1,
+        "defaultValue": 250
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 15,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 60
+      }
+    ]
+  }
+}
