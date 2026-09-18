@@ -57,8 +57,8 @@ Panel {
   }
 
   function pillColor(kind) {
-    if (kind === "fail") return Color.urgent
-    if (kind === "warn" || kind === "run") return Color.accent
+    if (kind === "fail" || kind === "warn") return Color.urgent
+    if (kind === "run") return Color.accent
     return foreground
   }
 

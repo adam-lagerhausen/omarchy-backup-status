@@ -18,7 +18,7 @@ omarchy bar move io.github.adam-lagerhausen.backup-status --section right
 
 ## What it shows
 
-The icon stays in the theme foreground while both jobs are healthy. It turns accent if a run is in progress or something is overdue / the repo is over 90% of quota. It turns urgent if a job failed or a timer is missing.
+The icon stays in the theme foreground while both jobs are healthy. It turns red if anything is wrong: a failed job, a missing timer, an overdue run, lingering off, or the repo over 90% of quota. A run in progress pulses in accent.
 
 The panel lists:
 

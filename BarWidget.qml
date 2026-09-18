@@ -43,8 +43,8 @@ BarWidget {
   }
 
   function colorFor(state) {
-    if (state === "failed" || state === "missing") return Color.urgent
-    if (state === "warning" || state === "running") return Color.accent
+    if (state === "failed" || state === "missing" || state === "warning") return Color.urgent
+    if (state === "running") return Color.accent
     return root.bar ? root.bar.barForeground : Color.foreground
   }
 
